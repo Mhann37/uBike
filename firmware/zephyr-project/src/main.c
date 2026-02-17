@@ -23,13 +23,13 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
-#include <zephyr/drivers/counter.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/mgmt/mcumgr/transport/smp_bt.h>
 #include <zephyr/random/rand32.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/types.h>
 
 #include "asciiModbus.h"
@@ -57,9 +57,6 @@ LOG_MODULE_REGISTER ( app );
 #define BUT2_NODE DT_ALIAS ( subinc )
 #define BUT3_NODE DT_ALIAS ( addres )
 #define BUT4_NODE DT_ALIAS ( subres )
-
-#define INC_ALARM_ID 0
-#define RES_ALARM_ID 1
 
 #define RX_BUFF_SIZE 100
 #define TX_BUFF_SIZE 20
@@ -147,8 +144,6 @@ static const struct gpio_dt_spec addInc = GPIO_DT_SPEC_GET ( BUT1_NODE, gpios );
 static const struct gpio_dt_spec subInc = GPIO_DT_SPEC_GET ( BUT3_NODE, gpios );
 static const struct gpio_dt_spec addRes = GPIO_DT_SPEC_GET ( BUT2_NODE, gpios );
 static const struct gpio_dt_spec subRes = GPIO_DT_SPEC_GET ( BUT4_NODE, gpios );
-static const struct device *rtc2_dev = DEVICE_DT_GET ( DT_NODELABEL ( rtc2 ) );
-struct counter_alarm_cfg alarmCfg;
 static struct gpio_callback addIncCbData;
 static struct gpio_callback subIncCbData;
 static struct gpio_callback addResCbData;
@@ -157,6 +152,14 @@ static uint8_t rx_buf_1 [RX_BUFF_SIZE] = { 0 };
 static uint8_t rx_buf_2 [RX_BUFF_SIZE] = { 0 };
 static uint8_t rx_buf_num = 1;
 static uint8_t tx_buf [TX_BUFF_SIZE] = { 0 };
+static atomic_t inc_repeat_active = ATOMIC_INIT ( 0 );
+static atomic_t res_repeat_active = ATOMIC_INIT ( 0 );
+
+static void inc_repeat_work_handler ( struct k_work *work );
+static void res_repeat_work_handler ( struct k_work *work );
+
+K_WORK_DELAYABLE_DEFINE ( inc_repeat_work, inc_repeat_work_handler );
+K_WORK_DELAYABLE_DEFINE ( res_repeat_work, res_repeat_work_handler );
 
 int send_cmd ( cmd_msg_data_t cmd )
 {
@@ -198,78 +201,76 @@ int send_cmd ( cmd_msg_data_t cmd )
     return 0;
 }
 
-static void counter_interrupt_cb ( const struct device *counter_dev,
-                                   uint8_t chan_id,
-                                   uint32_t ticks,
-                                   void *user_data )
+static void inc_repeat_work_handler ( struct k_work *work )
 {
     buttonStatus_t adj;
-    uint64_t delay_us;
-    if ( chan_id == INC_ALARM_ID ) {
-        adj = evaluateButton ( gpio_pin_get ( addInc.port, addInc.pin ),
-                               gpio_pin_get ( subInc.port, subInc.pin ) );
-        if ( adj == NOTHING ) {
-            return;
-        }
-        adjustIncline ( adj );
-        delay_us = INC_BUTTON_DLY_US;
-    } else if ( chan_id == RES_ALARM_ID ) {
-        adj = evaluateButton ( gpio_pin_get ( addRes.port, addRes.pin ),
-                               gpio_pin_get ( subRes.port, subRes.pin ) );
-        if ( adj == NOTHING ) {
-            return;
-        }
-        adjustResistance ( adj );
-        delay_us = RES_BUTTON_DLY_US;
-    } else {
-        LOG_ERR ( "Invalid channel id: %d!", chan_id );
+    ARG_UNUSED ( work );
+
+    adj = evaluateButton ( gpio_pin_get ( addInc.port, addInc.pin ),
+                           gpio_pin_get ( subInc.port, subInc.pin ) );
+    if ( adj == NOTHING ) {
+        atomic_clear ( &inc_repeat_active );
         return;
     }
 
-    // Restart
-    alarmCfg.ticks = counter_us_to_ticks ( rtc2_dev, delay_us );
-    int err = counter_set_channel_alarm ( counter_dev, chan_id, &alarmCfg );
-    if ( err ) {
-        LOG_ERR ( "Alarm %d could not be set! Error: %d", chan_id, err );
+    adjustIncline ( adj );
+    k_work_reschedule ( &inc_repeat_work, K_USEC ( INC_BUTTON_DLY_US ) );
+}
+
+static void res_repeat_work_handler ( struct k_work *work )
+{
+    buttonStatus_t adj;
+    ARG_UNUSED ( work );
+
+    adj = evaluateButton ( gpio_pin_get ( addRes.port, addRes.pin ),
+                           gpio_pin_get ( subRes.port, subRes.pin ) );
+    if ( adj == NOTHING ) {
+        atomic_clear ( &res_repeat_active );
+        return;
     }
+
+    adjustResistance ( adj );
+    k_work_reschedule ( &res_repeat_work, K_USEC ( RES_BUTTON_DLY_US ) );
 }
 
 static void incPressed ( const struct device *dev,
                          struct gpio_callback *cb,
                          uint32_t pins )
 {
-    alarmCfg.ticks = counter_us_to_ticks ( rtc2_dev, INC_BUTTON_DLY_US );
-    int err = counter_set_channel_alarm ( rtc2_dev, INC_ALARM_ID, &alarmCfg );
-    if ( err ) {
-        LOG_ERR ( "Alarm %d could not be set! Error: %d", INC_ALARM_ID, err );
-    } else {
-        // Setting counter fails if its already been set, which is often the
-        // case when there is bounce in the signal.  So only increment if
-        // setting the timer does not fail, this implements a psuedo-debounce.
+    ARG_UNUSED ( dev );
+    ARG_UNUSED ( cb );
+    ARG_UNUSED ( pins );
+
+    // Only apply an immediate update on the first edge; repeated edges keep
+    // the periodic work active and debounce bounce events.
+    if ( atomic_cas ( &inc_repeat_active, 0, 1 ) ) {
         buttonStatus_t adj
             = evaluateButton ( gpio_pin_get ( addInc.port, addInc.pin ),
                                gpio_pin_get ( subInc.port, subInc.pin ) );
         adjustIncline ( adj );
     }
+
+    k_work_reschedule ( &inc_repeat_work, K_USEC ( INC_BUTTON_DLY_US ) );
 }
 
 static void resPressed ( const struct device *dev,
                          struct gpio_callback *cb,
                          uint32_t pins )
 {
-    alarmCfg.ticks = counter_us_to_ticks ( rtc2_dev, RES_BUTTON_DLY_US );
-    int err = counter_set_channel_alarm ( rtc2_dev, RES_ALARM_ID, &alarmCfg );
-    if ( err ) {
-        LOG_ERR ( "Alarm %d could not be set! Error: %d", RES_ALARM_ID, err );
-    } else {
-        // Setting counter fails if its already been set, which is often the
-        // case when there is bounce in the signal.  So only increment if
-        // setting the timer does not fail, this implements a psuedo-debounce.
+    ARG_UNUSED ( dev );
+    ARG_UNUSED ( cb );
+    ARG_UNUSED ( pins );
+
+    // Only apply an immediate update on the first edge; repeated edges keep
+    // the periodic work active and debounce bounce events.
+    if ( atomic_cas ( &res_repeat_active, 0, 1 ) ) {
         buttonStatus_t adj
             = evaluateButton ( gpio_pin_get ( addRes.port, addRes.pin ),
                                gpio_pin_get ( subRes.port, subRes.pin ) );
         adjustResistance ( adj );
     }
+
+    k_work_reschedule ( &res_repeat_work, K_USEC ( RES_BUTTON_DLY_US ) );
 }
 
 static void add_rx_bytes ( char *buff, size_t offset, size_t len )
@@ -524,19 +525,6 @@ void main ( void )
     }
     LOG_INF ( "Starting advertising..." );
     adv_start();
-
-    LOG_INF ( "Starting counter..." );
-    if ( !device_is_ready ( rtc2_dev ) ) {
-        LOG_ERR ( "Counter is not ready!" );
-        return;
-    }
-    if ( counter_start ( rtc2_dev ) ) {
-        LOG_ERR ( "Counter failed to start!" );
-        return;
-    }
-    alarmCfg.flags = 0;
-    alarmCfg.callback = counter_interrupt_cb;
-    alarmCfg.user_data = &alarmCfg;
 
     // Configure nodes
     LOG_INF ( "Configuring bike nodes..." );
